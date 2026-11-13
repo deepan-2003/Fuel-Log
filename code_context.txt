@@ -1,0 +1,1558 @@
+
+================================================================================
+FILE: .gitignore.txt
+================================================================================
+
+.venv
+config.zip
+__pycache__/
+__pycache__\
+
+
+================================================================================
+FILE: Start Fuel Log.bat
+================================================================================
+
+@echo off
+title Fleet Fuel Log
+cd /d "%~dp0"
+
+rem Use "python"; fall back to the "py" launcher if python is not on PATH
+set PY=python
+%PY% --version >nul 2>&1 || set PY=py
+
+rem First run only: install the required packages
+%PY% -c "import streamlit, pandas, openpyxl" >nul 2>&1 || (
+    echo Installing required packages, please wait...
+    %PY% -m pip install -r requirements.txt
+)
+
+echo Starting Fleet Fuel Log... your browser will open shortly.
+echo Keep this window open while using the app. Close it to stop the app.
+%PY% -m streamlit run app.py
+
+echo.
+echo The app stopped. Press any key to close this window.
+pause >nul
+
+
+
+================================================================================
+FILE: analytics.py
+================================================================================
+
+"""Pure-pandas helpers: derived columns, monthly roll-ups, period handling."""
+from __future__ import annotations
+
+import calendar
+from datetime import date, timedelta
+
+import pandas as pd
+
+METRICS = {
+    "Fuel cost (₹)": ("amount", "money"),
+    "Total KM": ("total_km", "int"),
+    "Fuel filled (L)": ("fuel_litres", "dec"),
+    "No. of fills": ("fills", "int"),
+    "Avg KM per litre": ("mileage", "dec"),
+    "Cost per KM (₹)": ("cost_per_km", "dec"),
+}
+
+PERIOD_CHOICES = [
+    "All time",
+    "This month",
+    "Last month",
+    "Last 30 days",
+    "This financial year (Apr-Mar)",
+    "Specific month",
+    "Custom range",
+]
+
+
+# --------------------------------------------------------------------------- #
+def _ratio(num: pd.Series, den: pd.Series) -> pd.Series:
+    """num / den, NaN wherever the denominator is zero or missing."""
+    return num / den.where(den > 0)
+
+
+def enrich(df: pd.DataFrame) -> pd.DataFrame:
+    """Add total_km, mileage, cost columns and month keys to an entries frame."""
+    df = df.copy()
+    df["entry_date"] = pd.to_datetime(df["entry_date"])
+    df["bill_date"] = pd.to_datetime(df["bill_date"], errors="coerce")
+    df["total_km"] = df["closing_km"] - df["starting_km"]
+    df["mileage"] = _ratio(df["total_km"], df["fuel_litres"])
+    df["rate_per_litre"] = _ratio(df["amount"], df["fuel_litres"])
+    df["cost_per_km"] = _ratio(df["amount"], df["total_km"])
+    df["month_key"] = df["entry_date"].dt.strftime("%Y-%m")
+    df["month_label"] = df["entry_date"].dt.strftime("%b %Y")
+    return df
+
+
+def month_label(key: str) -> str:
+    return pd.Timestamp(key + "-01").strftime("%b %Y")
+
+
+def totals(df: pd.DataFrame) -> dict:
+    km = float(df["total_km"].sum()) if len(df) else 0.0
+    fuel = float(df["fuel_litres"].sum()) if len(df) else 0.0
+    amt = float(df["amount"].sum()) if len(df) else 0.0
+    return {
+        "fills": int(len(df)),
+        "total_km": km,
+        "fuel_litres": fuel,
+        "amount": amt,
+        "mileage": km / fuel if fuel > 0 else None,
+        "cost_per_km": amt / km if km > 0 else None,
+        "rate_per_litre": amt / fuel if fuel > 0 else None,
+    }
+
+
+def monthly_summary(df: pd.DataFrame, by_vehicle: bool = True) -> pd.DataFrame:
+    cols = ["reg_no", "month_key", "month_label", "fills", "total_km",
+            "fuel_litres", "amount", "mileage", "cost_per_km", "rate_per_litre"]
+    if df.empty:
+        return pd.DataFrame(columns=cols)
+    keys = (["reg_no"] if by_vehicle else []) + ["month_key", "month_label"]
+    g = df.groupby(keys, as_index=False).agg(
+        fills=("id", "count"),
+        total_km=("total_km", "sum"),
+        fuel_litres=("fuel_litres", "sum"),
+        amount=("amount", "sum"),
+    )
+    g["mileage"] = _ratio(g["total_km"], g["fuel_litres"])
+    g["cost_per_km"] = _ratio(g["amount"], g["total_km"])
+    g["rate_per_litre"] = _ratio(g["amount"], g["fuel_litres"])
+    if not by_vehicle:
+        g.insert(0, "reg_no", "All vehicles")
+    return g.sort_values(["reg_no", "month_key"]).reset_index(drop=True)
+
+
+def vehicle_summary(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
+        return pd.DataFrame(columns=["reg_no", "fills", "total_km", "fuel_litres",
+                                     "amount", "mileage", "cost_per_km", "last_fill"])
+    g = df.groupby("reg_no", as_index=False).agg(
+        fills=("id", "count"),
+        total_km=("total_km", "sum"),
+        fuel_litres=("fuel_litres", "sum"),
+        amount=("amount", "sum"),
+        last_fill=("entry_date", "max"),
+    )
+    g["mileage"] = _ratio(g["total_km"], g["fuel_litres"])
+    g["cost_per_km"] = _ratio(g["amount"], g["total_km"])
+    return g.sort_values("reg_no").reset_index(drop=True)
+
+
+def month_keys_between(df: pd.DataFrame) -> list[str]:
+    """Continuous list of YYYY-MM keys from the first to the last entry."""
+    if df.empty:
+        return []
+    lo, hi = df["entry_date"].min(), df["entry_date"].max()
+    return [str(p) for p in pd.period_range(lo, hi, freq="M")]
+
+
+def _sum_matrix(d: pd.DataFrame, col: str, keys: list[str]) -> pd.DataFrame:
+    p = (d.pivot_table(index="reg_no", columns="month_key", values=col,
+                       aggfunc="sum", fill_value=0)
+          .reindex(columns=keys, fill_value=0))
+    p["Total"] = p.sum(axis=1)
+    p.loc["All vehicles"] = p.sum(axis=0)
+    return p
+
+
+def month_matrix(df: pd.DataFrame, metric: str) -> pd.DataFrame:
+    """Vehicles (+ 'All vehicles') as rows, months (+ 'Total') as columns."""
+    if df.empty:
+        return pd.DataFrame()
+    d = df.copy()
+    d["fills"] = 1
+    keys = month_keys_between(d)
+    field = METRICS[metric][0]
+    if field in ("fills", "total_km", "fuel_litres", "amount"):
+        return _sum_matrix(d, field, keys)
+    km = _sum_matrix(d, "total_km", keys)
+    if field == "mileage":
+        return km / _sum_matrix(d, "fuel_litres", keys).where(lambda x: x > 0)
+    return _sum_matrix(d, "amount", keys) / km.where(km > 0)
+
+
+# --------------------------------------------------------------------------- #
+def resolve_period(choice: str, today: date | None = None, custom=(None, None),
+                   month_key: str | None = None):
+    """Translate a period choice into an inclusive (start, end) date pair."""
+    today = today or date.today()
+
+    def month_bounds(y: int, m: int):
+        return date(y, m, 1), date(y, m, calendar.monthrange(y, m)[1])
+
+    if choice == "This month":
+        return month_bounds(today.year, today.month)
+    if choice == "Last month":
+        first = today.replace(day=1) - timedelta(days=1)
+        return month_bounds(first.year, first.month)
+    if choice == "Last 30 days":
+        return today - timedelta(days=29), today
+    if choice.startswith("This financial year"):
+        y = today.year if today.month >= 4 else today.year - 1
+        return date(y, 4, 1), date(y + 1, 3, 31)
+    if choice == "Specific month" and month_key:
+        y, m = (int(x) for x in month_key.split("-"))
+        return month_bounds(y, m)
+    if choice == "Custom range":
+        return custom
+    return None, None
+
+
+
+================================================================================
+FILE: app.py
+================================================================================
+
+"""Fleet Fuel Log - Streamlit app.
+Run:  streamlit run app.py
+"""
+from __future__ import annotations
+
+from datetime import date, datetime
+from io import BytesIO
+
+import pandas as pd
+import streamlit as st
+
+import analytics as an
+import db
+from excel_export import build_workbook, parse_report, sample_template
+
+CUR = "₹"
+DEFAULT_ORG = "O.P.R. Group of Educational Institutions"
+
+st.set_page_config(page_title="Fleet Fuel Log", page_icon="⛽", layout="wide",
+                   initial_sidebar_state="expanded")
+
+
+def _ver(v: str) -> tuple:
+    out = []
+    for p in v.split(".")[:2]:
+        out.append(int("".join(ch for ch in p if ch.isdigit()) or 0))
+    return tuple(out)
+
+
+# `use_container_width` was replaced by `width="stretch"` in newer Streamlit releases.
+STRETCH = {"width": "stretch"} if _ver(st.__version__) >= (1, 50) else {"use_container_width": True}
+
+db.init_db()
+
+st.markdown("""
+<style>
+.block-container{padding-top:1.2rem;padding-bottom:2.5rem;max-width:1500px;}
+.app-banner{background:linear-gradient(135deg,#1F3864 0%,#2E75B6 100%);padding:1.1rem 1.6rem;
+  border-radius:14px;margin-bottom:1.1rem;box-shadow:0 4px 14px rgba(31,56,100,.18);}
+.app-banner h1{margin:0;font-size:1.65rem;font-weight:700;color:#fff;letter-spacing:.2px;}
+.app-banner p{margin:.25rem 0 0;color:#DCE8F7;font-size:.92rem;}
+div[data-testid="stMetric"]{background:#fff;border:1px solid #E3E8F0;border-radius:12px;
+  padding:.85rem 1rem;box-shadow:0 1px 3px rgba(16,24,40,.06);}
+div[data-testid="stMetricLabel"] p{color:#5B6B84;font-size:.82rem;font-weight:600;}
+div[data-testid="stMetricValue"]{color:#1F3864;font-size:1.55rem;font-weight:700;}
+.sec{font-size:1.05rem;font-weight:700;color:#1F3864;margin:1.2rem 0 .4rem;
+  padding-left:.6rem;border-left:4px solid #2E75B6;}
+.chip{display:inline-block;background:#E8F1FB;color:#1F3864;border-radius:999px;
+  padding:.15rem .7rem;font-size:.8rem;font-weight:600;margin-right:.35rem;}
+button[data-baseweb="tab"]{font-weight:600;}
+</style>
+""", unsafe_allow_html=True)
+
+
+# ------------------------------------------------------------------ helpers --
+def section(title: str) -> None:
+    st.markdown(f'<div class="sec">{title}</div>', unsafe_allow_html=True)
+
+
+def money(x, dec=0) -> str:
+    return "-" if x is None or pd.isna(x) else f"{CUR}{x:,.{dec}f}"
+
+
+def num(x, dec=0) -> str:
+    return "-" if x is None or pd.isna(x) else f"{x:,.{dec}f}"
+
+
+def _blank(x):
+    return "" if x is None or (not isinstance(x, str) and pd.isna(x)) else x
+
+
+def _norm(v):
+    """Normalise a cell so edited and original values compare cleanly."""
+    if v is None or (not isinstance(v, str) and pd.isna(v)):
+        return None
+    if isinstance(v, (pd.Timestamp, datetime)):
+        return v.date()
+    if isinstance(v, str):
+        return v.strip()
+    if isinstance(v, float):
+        return round(v, 4)
+    return v
+
+
+# --------------------------------------------------------- data + sidebar ---
+vehicles = db.vehicles_df()
+all_entries = db.entries_df()
+reg_by_id = dict(zip(vehicles["id"], vehicles["reg_no"]))
+
+with st.sidebar:
+    st.markdown("## ⛽ Fleet Fuel Log")
+    st.caption("Filters apply to the Dashboard, Manage Entries and Excel export.")
+    sel_ids = st.multiselect("Vehicles", options=list(vehicles["id"]),
+                             default=list(vehicles["id"]),
+                             format_func=lambda i: reg_by_id.get(i, str(i)),
+                             placeholder="All vehicles")
+    period_choice = st.selectbox("Period", an.PERIOD_CHOICES)
+    month_key, custom = None, (None, None)
+    if period_choice == "Specific month":
+        keys = sorted(all_entries["month_key"].unique(), reverse=True) if len(all_entries) else []
+        if keys:
+            month_key = st.selectbox("Month", keys, format_func=an.month_label)
+        else:
+            st.caption("No entries yet.")
+    elif period_choice == "Custom range":
+        c1 = st.date_input("From", value=date.today().replace(day=1), format="DD/MM/YYYY")
+        c2 = st.date_input("To", value=date.today(), format="DD/MM/YYYY")
+        custom = (c1, c2)
+    start, end = an.resolve_period(period_choice, date.today(), custom, month_key)
+
+    st.divider()
+    org_name = st.text_input("Organisation name (for Excel report)",
+                             value=db.get_setting("org_name", DEFAULT_ORG))
+    if org_name != db.get_setting("org_name", DEFAULT_ORG):
+        db.set_setting("org_name", org_name)
+
+df = db.entries_df(vehicle_ids=sel_ids or None, start=start, end=end)
+if len(df):
+    period_label = f"{df['entry_date'].min():%d %b %Y} - {df['entry_date'].max():%d %b %Y}"
+else:
+    period_label = "No entries"
+scope_vehicles = len(sel_ids) if sel_ids else len(vehicles)
+
+st.markdown(
+    f'<div class="app-banner"><h1>⛽ Fleet Fuel Log</h1>'
+    f'<p>{org_name} &nbsp;•&nbsp; {scope_vehicles} vehicle(s) &nbsp;•&nbsp; {len(df)} fill(s) &nbsp;•&nbsp; {period_label}</p></div>',
+    unsafe_allow_html=True)
+
+if vehicles.empty:
+    st.info("👋 Welcome! Add your first vehicle in the **🚘 Vehicles** tab, or load sample data to explore.")
+    if st.button("Load sample data", type="secondary"):
+        db.load_demo_data()
+        st.rerun()
+
+tab_dash, tab_new, tab_manage, tab_veh, tab_xl = st.tabs(
+    ["📊 Dashboard", "➕ New Entry", "✏️ Manage Entries", "🚘 Vehicles", "📥 Export / Import"])
+
+
+# ================================================================ DASHBOARD ==
+with tab_dash:
+    if df.empty:
+        st.info("No fuel entries for the selected vehicles and period.")
+    else:
+        t = an.totals(df)
+        k = st.columns(6)
+        k[0].metric("Total KM", num(t["total_km"]))
+        k[1].metric("Fuel filled", f"{num(t['fuel_litres'], 1)} L")
+        k[2].metric("Fuel cost", money(t["amount"]))
+        k[3].metric("Avg KM / L", num(t["mileage"], 2))
+        k[4].metric("Cost / KM", money(t["cost_per_km"], 2))
+        k[5].metric("No. of fills", num(t["fills"]))
+
+        # FC reminders
+        today = pd.Timestamp(date.today())
+        shown = vehicles[vehicles["id"].isin(sel_ids)] if sel_ids else vehicles
+        for _, v in shown.dropna(subset=["fc_date"]).iterrows():
+            days = (v["fc_date"] - today).days
+            if days < 0:
+                st.error(f"🚨 FC for **{v['reg_no']}** expired {-days} day(s) ago ({v['fc_date']:%d-%m-%Y}).")
+            elif days <= 30:
+                st.warning(f"⚠️ FC for **{v['reg_no']}** is due in {days} day(s) ({v['fc_date']:%d-%m-%Y}).")
+
+        section("Month-wise totals")
+        view = st.radio("View", ["Vehicle-wise", "Combined"], horizontal=True, label_visibility="collapsed")
+        ms = an.monthly_summary(df, by_vehicle=(view == "Vehicle-wise"))
+        tbl = ms[["reg_no", "month_label", "fills", "total_km", "fuel_litres", "amount",
+                  "mileage", "cost_per_km", "rate_per_litre"]].copy()
+        tbl.loc[len(tbl)] = ["All vehicles" if view == "Vehicle-wise" else "All", "TOTAL", t["fills"],
+                             t["total_km"], t["fuel_litres"], t["amount"], t["mileage"],
+                             t["cost_per_km"], t["rate_per_litre"]]
+        tbl.columns = ["Vehicle", "Month", "Fills", "Total KM", "Fuel (L)", f"Amount ({CUR})",
+                       "Avg KM/L", f"Cost/KM ({CUR})", f"Rate/L ({CUR})"]
+        styled = (tbl.style
+                  .format({"Fills": "{:,.0f}", "Total KM": "{:,.0f}", "Fuel (L)": "{:,.2f}",
+                           f"Amount ({CUR})": "{:,.2f}", "Avg KM/L": "{:.2f}",
+                           f"Cost/KM ({CUR})": "{:.2f}", f"Rate/L ({CUR})": "{:.2f}"}, na_rep="-")
+                  .set_properties(subset=pd.IndexSlice[tbl.index[-1], :],
+                                  **{"font-weight": "700", "background-color": "#DDEBF7"}))
+        st.dataframe(styled, hide_index=True, **STRETCH)
+
+        section("Month × Vehicle matrix")
+        metric = st.selectbox("Metric", list(an.METRICS), label_visibility="collapsed")
+        mm = an.month_matrix(df, metric)
+        mm.columns = [c if c == "Total" else an.month_label(c) for c in mm.columns]
+        mm.index.name = "Vehicle"
+        kind = an.METRICS[metric][1]
+        fmt = {"int": "{:,.0f}", "dec": "{:,.2f}", "money": "{:,.0f}"}[kind]
+        mstyled = (mm.style.format(fmt, na_rep="-")
+                   .set_properties(subset=pd.IndexSlice[:, ["Total"]],
+                                   **{"font-weight": "700", "background-color": "#DDEBF7"})
+                   .set_properties(subset=pd.IndexSlice[["All vehicles"], :],
+                                   **{"font-weight": "700", "background-color": "#DDEBF7"}))
+        st.dataframe(mstyled, **STRETCH)
+
+        section("Trends")
+        by_v = an.monthly_summary(df, by_vehicle=True)
+        c1, c2 = st.columns(2)
+        with c1:
+            st.caption(f"Monthly fuel cost ({CUR})")
+            st.bar_chart(by_v.pivot(index="month_key", columns="reg_no", values="amount").fillna(0))
+        with c2:
+            st.caption("Average KM per litre by month")
+            st.line_chart(by_v.pivot(index="month_key", columns="reg_no", values="mileage"))
+        st.caption("Mileage of every fill (KM per litre)")
+        st.line_chart(df.pivot_table(index="entry_date", columns="reg_no", values="mileage", aggfunc="mean"))
+
+        section("Vehicle comparison")
+        vs = an.vehicle_summary(df)
+        vs_tbl = pd.DataFrame({
+            "Vehicle": vs["reg_no"], "Fills": vs["fills"], "Total KM": vs["total_km"],
+            "Fuel (L)": vs["fuel_litres"], f"Amount ({CUR})": vs["amount"],
+            "Avg KM/L": vs["mileage"], f"Cost/KM ({CUR})": vs["cost_per_km"],
+            "Last fill": vs["last_fill"].dt.strftime("%d-%m-%Y")})
+        st.dataframe(vs_tbl.style.format({"Fills": "{:,.0f}", "Total KM": "{:,.0f}", "Fuel (L)": "{:,.2f}",
+                                          f"Amount ({CUR})": "{:,.2f}", "Avg KM/L": "{:.2f}",
+                                          f"Cost/KM ({CUR})": "{:.2f}"}, na_rep="-"),
+                     hide_index=True, **STRETCH)
+
+        valid = df.dropna(subset=["mileage"])
+        if len(valid):
+            best, worst = valid.loc[valid["mileage"].idxmax()], valid.loc[valid["mileage"].idxmin()]
+            i1, i2 = st.columns(2)
+            i1.success(f"🏆 Best mileage: **{best['mileage']:.2f} km/L** — {best['reg_no']} on {best['entry_date']:%d-%m-%Y}")
+            i2.warning(f"📉 Lowest mileage: **{worst['mileage']:.2f} km/L** — {worst['reg_no']} on {worst['entry_date']:%d-%m-%Y}")
+
+
+# ================================================================ NEW ENTRY ==
+def _reset_entry_form():
+    s = st.session_state
+    s["ne_close"], s["ne_fuel"], s["ne_amount"] = 0, 0.0, 0.0
+    s["ne_bill"], s["ne_remarks"] = "", ""
+
+
+def _save_entry(vid: int, start_key: str):
+    s = st.session_state
+    try:
+        bill_date = s["ne_date"] if s.get("ne_bill_same", True) else s["ne_bill_date"]
+        db.add_entry(vid, s["ne_date"], s["ne_close"], s[start_key], s["ne_fuel"],
+                     s["ne_bill"], bill_date, s["ne_amount"], s["ne_remarks"])
+    except ValueError as exc:
+        s["flash"] = ("error", str(exc))
+        return
+    s["flash"] = ("success", "Entry saved ✔")
+    _reset_entry_form()
+
+
+with tab_new:
+    if vehicles.empty:
+        st.info("Add a vehicle first (🚘 Vehicles tab).")
+    else:
+        flash = st.session_state.pop("flash", None)
+        if flash:
+            (st.success if flash[0] == "success" else st.error)(flash[1])
+
+        active = vehicles[vehicles["active"]]
+        pool = active if len(active) else vehicles
+        left, right = st.columns([3, 2], gap="large")
+        with left:
+            section("Record a fill")
+            vid = st.selectbox("Vehicle", list(pool["id"]), key="ne_vehicle",
+                               format_func=lambda i: f"{reg_by_id[i]}  -  {pool.set_index('id').loc[i, 'name'] or 'vehicle'}")
+            vrow = vehicles.set_index("id").loc[vid]
+            last_close = db.last_closing_km(vid)
+            start_key = f"ne_start_{vid}_{int(last_close)}"
+            a, b = st.columns(2)
+            a.date_input("Date", value=date.today(), key="ne_date", format="DD/MM/YYYY")
+            b.number_input("Starting KM", min_value=0, step=1, value=int(last_close), key=start_key,
+                           help="Pre-filled with the last closing KM of this vehicle.")
+            a, b = st.columns(2)
+            a.number_input("Closing KM", min_value=0, step=1, value=0, key="ne_close")
+            b.number_input("Fuel filled (litres)", min_value=0.0, step=0.01, format="%.2f", key="ne_fuel")
+            a, b = st.columns(2)
+            a.number_input(f"Amount ({CUR})", min_value=0.0, step=0.01, format="%.2f", key="ne_amount")
+            b.text_input("Bill No", key="ne_bill")
+            st.checkbox("Bill date is the same as the fill date", value=True, key="ne_bill_same")
+            if not st.session_state.get("ne_bill_same", True):
+                st.date_input("Bill date", value=date.today(), key="ne_bill_date", format="DD/MM/YYYY")
+            st.text_input("Remarks (optional)", key="ne_remarks")
+            st.button("💾 Save entry", type="primary", on_click=_save_entry, args=(vid, start_key), **STRETCH)
+
+        with right:
+            section("Live preview")
+            s = st.session_state
+            km = (s.get("ne_close", 0) or 0) - (s.get(start_key, 0) or 0)
+            fuel, amt = s.get("ne_fuel", 0.0) or 0.0, s.get("ne_amount", 0.0) or 0.0
+            p1, p2 = st.columns(2)
+            p1.metric("Total KM", num(km) if km > 0 else "-")
+            p2.metric("Avg KM / L", num(km / fuel, 2) if km > 0 and fuel > 0 else "-")
+            p3, p4 = st.columns(2)
+            p3.metric("Rate / L", money(amt / fuel, 2) if fuel > 0 else "-")
+            p4.metric("Cost / KM", money(amt / km, 2) if km > 0 and amt > 0 else "-")
+            tank = float(vrow["tank_capacity"] or 0)
+            if tank and fuel > tank:
+                st.warning(f"Fuel ({fuel:g} L) is more than the tank capacity ({tank:g} L).")
+            if s.get("ne_close", 0) and s.get("ne_close", 0) <= s.get(start_key, 0):
+                st.warning("Closing KM must be greater than Starting KM.")
+            if db.bill_exists(vid, s.get("ne_bill", "")):
+                st.warning("This bill number is already recorded for this vehicle.")
+            fc = vrow["fc_date"]
+            if pd.notna(fc):
+                st.caption(f"FC due: {fc:%d-%m-%Y}  |  Driver: {vrow['driver'] or '-'}")
+
+            section("Recent entries")
+            rec = all_entries[all_entries["vehicle_id"] == vid].sort_values(["entry_date", "id"], ascending=False).head(5)
+            if len(rec):
+                st.dataframe(pd.DataFrame({
+                    "Date": rec["entry_date"].dt.strftime("%d-%m-%Y"), "KM": rec["total_km"],
+                    "Litres": rec["fuel_litres"], "KM/L": rec["mileage"], f"{CUR}": rec["amount"]}
+                ).style.format({"KM": "{:,.0f}", "Litres": "{:.2f}", "KM/L": "{:.2f}", f"{CUR}": "{:,.2f}"}),
+                    hide_index=True, **STRETCH)
+            else:
+                st.caption("No entries yet for this vehicle.")
+
+
+# ============================================================ MANAGE ENTRIES ==
+EDIT_COLS = ["Date", "Closing KM", "Starting KM", "Fuel (L)", "Bill No", "Bill Date", "Amount", "Remarks"]
+
+with tab_manage:
+    if df.empty:
+        st.info("No entries match the current filters.")
+    else:
+        section("Edit or delete entries")
+        st.caption("Double-click a cell to edit. Tick **Delete** to remove a row. Then press **Save changes**.")
+        view_df = df.sort_values(["entry_date", "id"], ascending=False).reset_index(drop=True)
+        src = pd.DataFrame({
+            "id": view_df["id"],
+            "Delete": False,
+            "Vehicle": view_df["reg_no"],
+            "Date": view_df["entry_date"].dt.date,
+            "Closing KM": view_df["closing_km"],
+            "Starting KM": view_df["starting_km"],
+            "Total KM": view_df["total_km"],
+            "Fuel (L)": view_df["fuel_litres"],
+            "Avg KM/L": view_df["mileage"].round(2),
+            "Bill No": view_df["bill_no"].map(_blank),
+            "Bill Date": [d.date() if pd.notna(d) else None for d in view_df["bill_date"]],
+            "Amount": view_df["amount"],
+            "Remarks": view_df["remarks"].map(_blank),
+        })
+        ver = st.session_state.setdefault("editor_ver", 0)
+        edited = st.data_editor(
+            src, key=f"editor_{ver}", hide_index=True, num_rows="fixed",
+            disabled=["id", "Vehicle", "Total KM", "Avg KM/L"],
+            column_config={
+                "id": None,
+                "Delete": st.column_config.CheckboxColumn("🗑 Delete", width="small"),
+                "Date": st.column_config.DateColumn("Date", format="DD-MM-YYYY", required=True),
+                "Bill Date": st.column_config.DateColumn("Bill Date", format="DD-MM-YYYY"),
+                "Closing KM": st.column_config.NumberColumn("Closing KM", format="%d", min_value=0),
+                "Starting KM": st.column_config.NumberColumn("Starting KM", format="%d", min_value=0),
+                "Total KM": st.column_config.NumberColumn("Total KM", format="%d"),
+                "Fuel (L)": st.column_config.NumberColumn("Fuel (L)", format="%.2f", min_value=0.0),
+                "Avg KM/L": st.column_config.NumberColumn("Avg KM/L", format="%.2f"),
+                "Amount": st.column_config.NumberColumn(f"Amount ({CUR})", format="%.2f", min_value=0.0),
+            }, **STRETCH)
+
+        n_del = int(edited["Delete"].sum())
+        if st.button(f"💾 Save changes" + (f"  (delete {n_del})" if n_del else ""), type="primary"):
+            upd, dele, errors = 0, [], []
+            for i in range(len(src)):
+                row_new, row_old = edited.iloc[i], src.iloc[i]
+                eid = int(row_old["id"])
+                if bool(row_new["Delete"]):
+                    dele.append(eid)
+                    continue
+                if all(_norm(row_new[c]) == _norm(row_old[c]) for c in EDIT_COLS):
+                    continue
+                try:
+                    db.update_entry(eid, row_new["Date"], row_new["Closing KM"], row_new["Starting KM"],
+                                    row_new["Fuel (L)"], _blank(row_new["Bill No"]), row_new["Bill Date"],
+                                    row_new["Amount"], _blank(row_new["Remarks"]))
+                    upd += 1
+                except Exception as exc:
+                    errors.append(f"{row_old['Vehicle']} {row_old['Date']:%d-%m-%Y}: {exc}")
+            db.delete_entries(dele)
+            for msg in errors:
+                st.error(msg)
+            if upd or dele:
+                st.toast(f"Updated {upd}, deleted {len(dele)}", icon="✅")
+            if not errors:
+                st.session_state["editor_ver"] = ver + 1
+                st.rerun()
+
+
+# ================================================================== VEHICLES ==
+def _delete_vehicle(vehicle_id: int) -> None:
+    """Runs as a button callback, so it may reset the checkbox's session state."""
+    db.delete_vehicle(vehicle_id)
+    st.session_state["del_confirm"] = False
+
+
+with tab_veh:
+    section("Add a vehicle")
+    with st.form("add_vehicle", clear_on_submit=True):
+        a, b, c = st.columns(3)
+        reg = a.text_input("Registration No *", placeholder="TN-21-F-5500")
+        name = b.text_input("Description", placeholder="e.g. Para Medical Science bus")
+        driver = c.text_input("Driver")
+        a, b, c = st.columns(3)
+        tank = a.number_input("Tank capacity (L)", min_value=0.0, value=90.0, step=1.0)
+        has_fc = b.checkbox("Set FC due date")
+        fc = c.date_input("FC due date", value=date.today(), format="DD/MM/YYYY")
+        if st.form_submit_button("Add vehicle", type="primary"):
+            try:
+                db.add_vehicle(reg, name, driver, tank, fc if has_fc else None)
+                st.success(f"Vehicle {reg.strip().upper()} added.")
+                st.rerun()
+            except ValueError as exc:
+                st.error(str(exc))
+
+    if not vehicles.empty:
+        section("Your vehicles")
+        vsrc = pd.DataFrame({
+            "id": vehicles["id"], "Registration No": vehicles["reg_no"], "Description": vehicles["name"],
+            "Driver": vehicles["driver"], "Tank (L)": vehicles["tank_capacity"],
+            "FC due": [d.date() if pd.notna(d) else None for d in vehicles["fc_date"]],
+            "Active": vehicles["active"]})
+        vver = st.session_state.setdefault("veh_ver", 0)
+        vedit = st.data_editor(
+            vsrc, key=f"veh_editor_{vver}", hide_index=True, num_rows="fixed", disabled=["id", "Registration No"],
+            column_config={"id": None,
+                           "Tank (L)": st.column_config.NumberColumn(format="%.0f", min_value=0.0),
+                           "FC due": st.column_config.DateColumn("FC due", format="DD-MM-YYYY"),
+                           "Active": st.column_config.CheckboxColumn("Active")}, **STRETCH)
+        if st.button("💾 Save vehicle changes"):
+            for i in range(len(vsrc)):
+                r = vedit.iloc[i]
+                db.update_vehicle(int(r["id"]), _blank(r["Description"]), _blank(r["Driver"]),
+                                  r["Tank (L)"], r["FC due"], bool(r["Active"]))
+            st.session_state["veh_ver"] = vver + 1
+            st.toast("Vehicles updated", icon="✅")
+            st.rerun()
+
+        with st.expander("🗑 Delete a vehicle"):
+            del_id = st.selectbox("Vehicle to delete", list(vehicles["id"]),
+                                  format_func=lambda i: reg_by_id[i], key="del_vehicle")
+            n_ent = int((all_entries["vehicle_id"] == del_id).sum())
+            st.warning(f"This also deletes its {n_ent} fuel entr{'y' if n_ent == 1 else 'ies'}. This cannot be undone.")
+            confirmed = st.checkbox("I understand, delete permanently", key="del_confirm")
+            st.button("Delete vehicle", disabled=not confirmed, on_click=_delete_vehicle, args=(int(del_id),))
+
+
+# ============================================================ EXPORT / IMPORT ==
+@st.cache_data(show_spinner=False)
+def _make_xlsx(entries: pd.DataFrame, veh: pd.DataFrame, org: str, period: str) -> bytes:
+    return build_workbook(entries, veh, org, period)
+
+
+with tab_xl:
+    section("Export to Excel")
+    if df.empty:
+        st.info("Nothing to export for the current filters.")
+    else:
+        n_veh = df["reg_no"].nunique()
+        st.markdown(
+            f'<span class="chip">{n_veh} vehicle sheet(s)</span><span class="chip">Summary sheet</span>'
+            f'<span class="chip">{df["month_key"].nunique()} month(s)</span><span class="chip">{period_label}</span>',
+            unsafe_allow_html=True)
+        st.caption("Each vehicle sheet has month-wise sub totals and a grand total. "
+                   "The Summary sheet shows months as columns for every vehicle, plus a cost chart. "
+                   "Totals are live Excel formulas (click *Enable Editing* if Excel opens it in Protected View).")
+        xlsx = _make_xlsx(df, vehicles, org_name, period_label)
+        st.download_button("⬇️ Download Excel report", data=xlsx,
+                           file_name=f"Fuel_Log_{date.today():%Y%m%d}.xlsx",
+                           mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                           type="primary")
+
+    section("Restore / import data")
+    st.caption("Upload an **Excel report exported from this app** to restore everything (vehicles and all entries), "
+               "or a simple sheet with columns: " + ", ".join(db.IMPORT_COLUMNS) +
+               ". Entries already present (same vehicle, date and closing KM) are skipped, "
+               "so it is safe to upload the same file twice.")
+    st.download_button("Download import template (same layout as the export)", data=sample_template(),
+                       file_name="fuel_log_import_template.xlsx",
+                       mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+    up = st.file_uploader("Upload file", type=["xlsx", "csv"])
+    if up is not None:
+        try:
+            infos = []
+            if up.name.lower().endswith(".csv"):
+                imp = db.standardise_import(pd.read_csv(up))
+            else:
+                imp, infos = parse_report(up)
+                if imp.empty:  # not an export-layout file: treat as a flat table
+                    up.seek(0)
+                    imp = db.standardise_import(pd.read_excel(up))
+            if infos:
+                st.success(f"Recognised an exported report: {len(infos)} vehicle sheet(s), {len(imp)} entr"
+                           f"{'y' if len(imp) == 1 else 'ies'}.")
+            st.dataframe(imp.head(20), hide_index=True, **STRETCH)
+            st.caption(f"{len(imp)} row(s) found" + (" (first 20 shown)." if len(imp) > 20 else "."))
+            create = st.checkbox("Create vehicles that don't exist yet", value=True)
+            if st.button(f"Import {len(imp)} row(s)", type="primary"):
+                if create and infos:
+                    db.ensure_vehicles(infos)
+                ins, skip, msgs = db.import_entries(imp, create)
+                st.success(f"Imported {ins} row(s); skipped {skip}.")
+                for m in msgs[:25]:
+                    st.caption("• " + m)
+                if ins:
+                    st.rerun()
+        except Exception as exc:
+            st.error(f"Could not read the file: {exc}")
+
+    section("Backup")
+    st.download_button("Download database backup (.db)", data=db.backup_bytes(),
+                       file_name=f"fuel_log_backup_{date.today():%Y%m%d}.db",
+                       mime="application/octet-stream")
+
+
+
+================================================================================
+FILE: code_context.txt
+================================================================================
+
+
+
+
+================================================================================
+FILE: db.py
+================================================================================
+
+"""SQLite persistence for vehicles and fuel entries."""
+from __future__ import annotations
+
+import os
+import sqlite3
+from contextlib import contextmanager
+from datetime import date, datetime, timedelta
+from pathlib import Path
+
+import pandas as pd
+
+import analytics
+
+DB_PATH = Path(os.environ.get("FUEL_LOG_DB", Path(__file__).with_name("fuel_log.db")))
+
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS vehicles(
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    reg_no        TEXT NOT NULL UNIQUE,
+    name          TEXT DEFAULT '',
+    driver        TEXT DEFAULT '',
+    tank_capacity REAL DEFAULT 0,
+    fc_date       TEXT,
+    active        INTEGER NOT NULL DEFAULT 1
+);
+CREATE TABLE IF NOT EXISTS fuel_entries(
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    vehicle_id  INTEGER NOT NULL REFERENCES vehicles(id) ON DELETE CASCADE,
+    entry_date  TEXT NOT NULL,
+    closing_km  REAL NOT NULL,
+    starting_km REAL NOT NULL,
+    fuel_litres REAL NOT NULL,
+    bill_no     TEXT DEFAULT '',
+    bill_date   TEXT,
+    amount      REAL NOT NULL DEFAULT 0,
+    remarks     TEXT DEFAULT '',
+    created_at  TEXT DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS ix_entries_vehicle_date ON fuel_entries(vehicle_id, entry_date);
+CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, value TEXT);
+"""
+
+
+@contextmanager
+def connect():
+    con = sqlite3.connect(DB_PATH)
+    con.execute("PRAGMA foreign_keys = ON")
+    try:
+        yield con
+        con.commit()
+    finally:
+        con.close()
+
+
+def init_db() -> None:
+    with connect() as con:
+        con.executescript(SCHEMA)
+
+
+# ------------------------------------------------------------------ helpers --
+def _iso(d):
+    """Any date-like value -> 'YYYY-MM-DD' (or None when empty)."""
+    if d is None:
+        return None
+    if isinstance(d, str):
+        d = d.strip()
+        if not d:
+            return None
+        return pd.to_datetime(d, dayfirst=True).date().isoformat()
+    if pd.isna(d):
+        return None
+    if isinstance(d, (datetime, pd.Timestamp)):
+        return d.date().isoformat()
+    if isinstance(d, date):
+        return d.isoformat()
+    raise ValueError(f"Unrecognised date: {d!r}")
+
+
+def validate_entry(closing, starting, fuel, amount) -> None:
+    if closing is None or starting is None or pd.isna(closing) or pd.isna(starting):
+        raise ValueError("Closing and starting KM are required.")
+    if starting < 0:
+        raise ValueError("Starting KM cannot be negative.")
+    if closing <= starting:
+        raise ValueError("Closing KM must be greater than Starting KM.")
+    if fuel is None or pd.isna(fuel) or fuel <= 0:
+        raise ValueError("Fuel filled must be greater than 0 litres.")
+    if amount is None or pd.isna(amount) or amount < 0:
+        raise ValueError("Amount cannot be negative.")
+
+
+# ----------------------------------------------------------------- settings --
+def get_setting(key: str, default: str = "") -> str:
+    with connect() as con:
+        row = con.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
+    return row[0] if row else default
+
+
+def set_setting(key: str, value: str) -> None:
+    with connect() as con:
+        con.execute("INSERT INTO settings(key,value) VALUES(?,?) "
+                    "ON CONFLICT(key) DO UPDATE SET value=excluded.value", (key, value))
+
+
+# ----------------------------------------------------------------- vehicles --
+def vehicles_df(active_only: bool = False) -> pd.DataFrame:
+    q = "SELECT id, reg_no, name, driver, tank_capacity, fc_date, active FROM vehicles"
+    if active_only:
+        q += " WHERE active=1"
+    q += " ORDER BY reg_no"
+    with connect() as con:
+        df = pd.read_sql_query(q, con)
+    df["fc_date"] = pd.to_datetime(df["fc_date"], errors="coerce")
+    df["active"] = df["active"].astype(bool)
+    return df
+
+
+def _tank(v) -> float:
+    return 0.0 if v is None or pd.isna(v) else float(v)
+
+
+def add_vehicle(reg_no: str, name: str = "", driver: str = "",
+                tank_capacity: float = 0, fc_date=None) -> int:
+    reg_no = (reg_no or "").strip().upper()
+    if not reg_no:
+        raise ValueError("Vehicle registration number is required.")
+    try:
+        with connect() as con:
+            cur = con.execute(
+                "INSERT INTO vehicles(reg_no,name,driver,tank_capacity,fc_date) VALUES(?,?,?,?,?)",
+                (reg_no, (name or "").strip(), (driver or "").strip(),
+                 _tank(tank_capacity), _iso(fc_date)))
+            return cur.lastrowid
+    except sqlite3.IntegrityError:
+        raise ValueError(f"Vehicle {reg_no} already exists.") from None
+
+
+def update_vehicle(vehicle_id: int, name: str, driver: str, tank_capacity: float,
+                   fc_date, active: bool) -> None:
+    with connect() as con:
+        con.execute(
+            "UPDATE vehicles SET name=?, driver=?, tank_capacity=?, fc_date=?, active=? WHERE id=?",
+            ((name or "").strip(), (driver or "").strip(), _tank(tank_capacity),
+             _iso(fc_date), 1 if active else 0, int(vehicle_id)))
+
+
+def delete_vehicle(vehicle_id: int) -> None:
+    with connect() as con:
+        con.execute("DELETE FROM vehicles WHERE id=?", (int(vehicle_id),))
+
+
+def vehicle_id_by_reg(reg_no: str):
+    with connect() as con:
+        row = con.execute("SELECT id FROM vehicles WHERE reg_no=?",
+                          ((reg_no or "").strip().upper(),)).fetchone()
+    return row[0] if row else None
+
+
+# ------------------------------------------------------------------ entries --
+def add_entry(vehicle_id, entry_date, closing_km, starting_km, fuel_litres,
+              bill_no="", bill_date=None, amount=0.0, remarks="") -> int:
+    validate_entry(closing_km, starting_km, fuel_litres, amount)
+    with connect() as con:
+        cur = con.execute(
+            """INSERT INTO fuel_entries(vehicle_id, entry_date, closing_km, starting_km,
+               fuel_litres, bill_no, bill_date, amount, remarks) VALUES(?,?,?,?,?,?,?,?,?)""",
+            (int(vehicle_id), _iso(entry_date), float(closing_km), float(starting_km),
+             float(fuel_litres), (bill_no or "").strip(), _iso(bill_date),
+             float(amount), (remarks or "").strip()))
+        return cur.lastrowid
+
+
+def update_entry(entry_id, entry_date, closing_km, starting_km, fuel_litres,
+                 bill_no, bill_date, amount, remarks) -> None:
+    validate_entry(closing_km, starting_km, fuel_litres, amount)
+    with connect() as con:
+        con.execute(
+            """UPDATE fuel_entries SET entry_date=?, closing_km=?, starting_km=?, fuel_litres=?,
+               bill_no=?, bill_date=?, amount=?, remarks=? WHERE id=?""",
+            (_iso(entry_date), float(closing_km), float(starting_km), float(fuel_litres),
+             (bill_no or "").strip(), _iso(bill_date), float(amount),
+             (remarks or "").strip(), int(entry_id)))
+
+
+def delete_entries(ids) -> None:
+    ids = [int(i) for i in ids]
+    if not ids:
+        return
+    with connect() as con:
+        con.execute(f"DELETE FROM fuel_entries WHERE id IN ({','.join('?' * len(ids))})", ids)
+
+
+def entries_df(vehicle_ids=None, start=None, end=None) -> pd.DataFrame:
+    q = """SELECT e.id, e.vehicle_id, v.reg_no, e.entry_date, e.closing_km, e.starting_km,
+                  e.fuel_litres, e.bill_no, e.bill_date, e.amount, e.remarks
+           FROM fuel_entries e JOIN vehicles v ON v.id = e.vehicle_id WHERE 1=1"""
+    params: list = []
+    if vehicle_ids:
+        q += f" AND e.vehicle_id IN ({','.join('?' * len(vehicle_ids))})"
+        params += [int(i) for i in vehicle_ids]
+    if start:
+        q += " AND e.entry_date >= ?"
+        params.append(_iso(start))
+    if end:
+        q += " AND e.entry_date <= ?"
+        params.append(_iso(end))
+    q += " ORDER BY e.entry_date, e.id"
+    with connect() as con:
+        df = pd.read_sql_query(q, con, params=params)
+    return analytics.enrich(df)
+
+
+def last_closing_km(vehicle_id) -> float:
+    with connect() as con:
+        row = con.execute(
+            "SELECT closing_km FROM fuel_entries WHERE vehicle_id=? "
+            "ORDER BY entry_date DESC, id DESC LIMIT 1", (int(vehicle_id),)).fetchone()
+    return float(row[0]) if row else 0.0
+
+
+def bill_exists(vehicle_id, bill_no: str, exclude_id=None) -> bool:
+    bill_no = (bill_no or "").strip()
+    if not bill_no:
+        return False
+    q = "SELECT 1 FROM fuel_entries WHERE vehicle_id=? AND bill_no=?"
+    params: list = [int(vehicle_id), bill_no]
+    if exclude_id is not None:
+        q += " AND id<>?"
+        params.append(int(exclude_id))
+    with connect() as con:
+        return con.execute(q, params).fetchone() is not None
+
+
+def backup_bytes() -> bytes:
+    return DB_PATH.read_bytes() if DB_PATH.exists() else b""
+
+
+# ------------------------------------------------------------------- import --
+IMPORT_COLUMNS = ["Vehicle", "Date", "Closing KM", "Starting KM", "Fuel (L)",
+                  "Bill No", "Bill Date", "Amount", "Remarks"]
+_ALIASES = {
+    "Vehicle": {"vehicle", "vehicleno", "regno", "registration", "regnumber", "vehiclenumber"},
+    "Date": {"date", "entrydate"},
+    "Closing KM": {"closingkm", "closing", "closingreading"},
+    "Starting KM": {"startingkm", "starting", "openingkm", "startkm"},
+    "Fuel (L)": {"fuell", "fuel", "fuelfilled", "fuelfilledl", "litres", "liters", "fuelquantity"},
+    "Bill No": {"billno", "billnumber", "bill"},
+    "Bill Date": {"billdate"},
+    "Amount": {"amount", "amountrs", "amountinr", "cost"},
+    "Remarks": {"remarks", "remark", "notes"},
+}
+
+
+def _norm_header(h) -> str:
+    return "".join(ch for ch in str(h).lower() if ch.isalnum())
+
+
+def standardise_import(raw: pd.DataFrame) -> pd.DataFrame:
+    """Rename the uploaded sheet's headers to IMPORT_COLUMNS; raise if required ones are missing."""
+    lookup = {a: std for std, names in _ALIASES.items() for a in names}
+    rename = {}
+    for col in raw.columns:
+        std = lookup.get(_norm_header(col))
+        if std and std not in rename.values():
+            rename[col] = std
+    df = raw.rename(columns=rename)
+    missing = [c for c in ["Vehicle", "Date", "Closing KM", "Starting KM", "Fuel (L)", "Amount"]
+               if c not in df.columns]
+    if missing:
+        raise ValueError("Missing column(s): " + ", ".join(missing))
+    for c in IMPORT_COLUMNS:
+        if c not in df.columns:
+            df[c] = None
+    return df[IMPORT_COLUMNS].dropna(how="all")
+
+
+def ensure_vehicles(infos) -> int:
+    """Create any vehicle (with driver, tank, FC date) that does not exist yet."""
+    made = 0
+    for v in infos:
+        if vehicle_id_by_reg(v["reg_no"]) is None:
+            add_vehicle(v["reg_no"], v.get("name", ""), v.get("driver", ""),
+                        v.get("tank_capacity", 0), v.get("fc_date"))
+            made += 1
+    return made
+
+
+def import_entries(df: pd.DataFrame, create_missing: bool = True):
+    """Insert rows from a standardised frame. Returns (inserted, skipped, messages)."""
+    inserted, skipped, msgs = 0, 0, []
+    for i, row in df.iterrows():
+        line = i + 2  # header is line 1 in the source sheet
+        try:
+            reg = str(row["Vehicle"]).strip().upper()
+            vid = vehicle_id_by_reg(reg)
+            if vid is None:
+                if not create_missing or not reg or reg == "NAN":
+                    raise ValueError(f"unknown vehicle '{reg}'")
+                vid = add_vehicle(reg)
+            bill = "" if pd.isna(row["Bill No"]) else str(row["Bill No"]).strip()
+            if bill.endswith(".0"):
+                bill = bill[:-2]
+            remarks = "" if pd.isna(row["Remarks"]) else str(row["Remarks"])
+            if _is_duplicate(vid, row):
+                skipped += 1
+                msgs.append(f"Line {line}: skipped (same vehicle, date and closing KM already exist)")
+                continue
+            add_entry(vid, row["Date"], float(row["Closing KM"]), float(row["Starting KM"]),
+                      float(row["Fuel (L)"]), bill, row["Bill Date"],
+                      float(row["Amount"]) if not pd.isna(row["Amount"]) else 0.0, remarks)
+            inserted += 1
+        except Exception as exc:  # keep importing the remaining rows
+            skipped += 1
+            msgs.append(f"Line {line}: {exc}")
+    return inserted, skipped, msgs
+
+
+def _is_duplicate(vehicle_id, row) -> bool:
+    with connect() as con:
+        return con.execute(
+            "SELECT 1 FROM fuel_entries WHERE vehicle_id=? AND entry_date=? AND closing_km=?",
+            (int(vehicle_id), _iso(row["Date"]), float(row["Closing KM"]))).fetchone() is not None
+
+
+# --------------------------------------------------------------------- demo --
+def load_demo_data() -> None:
+    """Two sample vehicles with ~4 months of fills so the dashboard has something to show."""
+    demo = [
+        ("DEMO-BUS-1", "Sample staff bus", "Driver A", 90, 8.2, 70, 585),
+        ("DEMO-BUS-2", "Sample college van", "Driver B", 60, 10.5, 45, 470),
+    ]
+    start = date.today().replace(day=1) - timedelta(days=120)
+    for reg, name, drv, tank, kmpl, litres, km in demo:
+        if vehicle_id_by_reg(reg):
+            continue
+        vid = add_vehicle(reg, name, drv, tank, date.today() + timedelta(days=200))
+        odo = 40000.0
+        for k in range(16):
+            wobble = ((k * 7) % 5 - 2) * 0.25
+            fuel = round(litres + ((k * 3) % 5 - 2) * 1.6, 2)
+            dist = round(fuel * (kmpl + wobble))
+            d = start + timedelta(days=k * 7)
+            add_entry(vid, d, odo + dist, odo, fuel, f"B{1000 + k}{vid}", d,
+                      round(fuel * (97.5 + k * 0.3), 2), "")
+            odo += dist
+
+
+
+================================================================================
+FILE: excel_export.py
+================================================================================
+
+"""Professional Excel report: a Summary sheet (months as columns) + one sheet per vehicle
+with month-wise sub totals and a grand total. Totals are live Excel formulas."""
+from __future__ import annotations
+
+import io
+import re
+from datetime import date, datetime
+
+import pandas as pd
+from openpyxl import Workbook, load_workbook
+from openpyxl.chart import BarChart, Reference, Series
+from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
+from openpyxl.utils import get_column_letter as L
+from openpyxl.worksheet.properties import PageSetupProperties
+
+import analytics as an
+
+FONT = "Arial"
+NAVY, HEAD, BLUE = "1F3864", "1F4E78", "2E75B6"
+BAND, SUB, LIGHT, GRID = "DDEBF7", "BDD7EE", "F2F2F2", "BFBFBF"
+CUR = "₹"
+
+F_KM = '#,##0;-#,##0;"-"'
+F_DEC = '#,##0.00;-#,##0.00;"-"'
+F_MONEY = f'"{CUR}" #,##0.00;-"{CUR}" #,##0.00;"-"'
+F_INT = '0;-0;"-"'
+F_DATE = "dd-mm-yyyy"
+
+_thin = Side(style="thin", color=GRID)
+BOX = Border(left=_thin, right=_thin, top=_thin, bottom=_thin)
+TOP_RULE = Border(left=_thin, right=_thin, bottom=_thin, top=Side(style="medium", color=NAVY))
+
+
+def _fill(hex_: str) -> PatternFill:
+    return PatternFill("solid", start_color=hex_, end_color=hex_)
+
+
+def _put(ws, row, col, value=None, *, bold=False, italic=False, color="000000", size=10,
+         fill=None, h="center", v="center", fmt=None, border=BOX, wrap=False):
+    c = ws.cell(row, col)
+    if value is not None:
+        c.value = value
+    c.font = Font(name=FONT, size=size, bold=bold, italic=italic, color=color)
+    c.alignment = Alignment(horizontal=h, vertical=v, wrap_text=wrap)
+    if fill:
+        c.fill = _fill(fill)
+    if fmt:
+        c.number_format = fmt
+    if border:
+        c.border = border
+    return c
+
+
+def _merge(ws, row, c1, c2, value=None, **kw):
+    """Merge a horizontal range, styling every cell so borders/fills render fully."""
+    for c in range(c1, c2 + 1):
+        _put(ws, row, c, value if c == c1 else None, **kw)
+    if c2 > c1:
+        ws.merge_cells(start_row=row, start_column=c1, end_row=row, end_column=c2)
+
+
+def _banner(ws, ncol, org, subtitle, meta):
+    _merge(ws, 1, 1, ncol, org, bold=True, size=16, color="FFFFFF", fill=NAVY, border=None)
+    ws.row_dimensions[1].height = 30
+    _merge(ws, 2, 1, ncol, subtitle, bold=True, size=12, color="FFFFFF", fill=BLUE, border=None)
+    ws.row_dimensions[2].height = 22
+    _merge(ws, 3, 1, ncol, meta, italic=True, size=9, color="595959", border=None, h="left")
+
+
+def _safe_sheet_name(name: str, used: set[str]) -> str:
+    base = re.sub(r"[\[\]\:\*\?\/\\']", "-", name).strip()[:31] or "Vehicle"
+    cand, n = base, 2
+    while cand.lower() in used or cand.lower() == "summary":
+        suffix = f" ({n})"
+        cand = base[:31 - len(suffix)] + suffix
+        n += 1
+    used.add(cand.lower())
+    return cand
+
+
+def _page_setup(ws, title_rows=None):
+    ws.page_setup.orientation = "landscape"
+    ws.page_setup.paperSize = ws.PAPERSIZE_A4
+    ws.page_setup.fitToWidth = 1
+    ws.page_setup.fitToHeight = 0
+    ws.sheet_properties.pageSetUpPr = PageSetupProperties(fitToPage=True)
+    ws.print_options.horizontalCentered = True
+    ws.page_margins.left = ws.page_margins.right = 0.4
+    ws.oddFooter.center.text = "Page &P of &N"
+    ws.oddFooter.center.size = 8
+    if title_rows:
+        ws.print_title_rows = title_rows
+
+
+# --------------------------------------------------------------------------- #
+VEH_HEADERS = ["Date", "Closing KM", "Starting KM", "Total KM", "Fuel Filled (L)",
+               "Avg KM/L", "Bill No", "Bill Date", f"Amount ({CUR})", f"Cost / KM ({CUR})", "Remarks"]
+VEH_WIDTHS = [13, 13, 13, 12, 14, 11, 16, 13, 16, 14, 28]
+
+
+def _vehicle_sheet(wb, title, veh, g, org, period, generated):
+    ws = wb.create_sheet(title)
+    ws.sheet_view.showGridLines = False
+    ws.sheet_properties.tabColor = BLUE
+    n = len(VEH_HEADERS)
+    for i, w in enumerate(VEH_WIDTHS, 1):
+        ws.column_dimensions[L(i)].width = w
+
+    _banner(ws, n, org, f"Fuel Consumption Log  -  {veh['reg_no']}",
+            f"Period: {period}     |     Generated: {generated:%d-%m-%Y %H:%M}")
+
+    tank = float(veh.get("tank_capacity") or 0)
+    fc = veh.get("fc_date")
+    info = [
+        (4, "Vehicle No.", veh["reg_no"], "Driver", veh.get("driver") or "-"),
+        (5, "Description", veh.get("name") or "-", "Tank Capacity",
+         f"{tank:g} L" if tank else "-"),
+        (6, "FC Due", fc.strftime("%d-%m-%Y") if pd.notna(fc) else "-", "Period", period),
+    ]
+    for r, l1, v1, l2, v2 in info:
+        _put(ws, r, 1, l1, bold=True, fill=LIGHT, h="left")
+        _merge(ws, r, 2, 4, v1, h="left")
+        _put(ws, r, 5, l2, bold=True, fill=LIGHT, h="left", wrap=True)
+        _merge(ws, r, 6, n, v2, h="left")
+    ws.row_dimensions[8].height = 34
+    for i, h in enumerate(VEH_HEADERS, 1):
+        _put(ws, 8, i, h, bold=True, color="FFFFFF", fill=HEAD, wrap=True)
+    ws.freeze_panes = "A9"
+
+    r = 9
+    sub_rows: dict[str, int] = {}
+    for mk, grp in g.groupby("month_key", sort=True):
+        label = grp["month_label"].iloc[0]
+        _merge(ws, r, 1, n, label, bold=True, color=NAVY, fill=BAND, h="left", size=11)
+        ws.row_dimensions[r].height = 20
+        r += 1
+        first = r
+        for _, e in grp.sort_values(["entry_date", "id"]).iterrows():
+            bill_date = e["bill_date"].date() if pd.notna(e["bill_date"]) else None
+            _put(ws, r, 1, e["entry_date"].date(), fmt=F_DATE)
+            _put(ws, r, 2, float(e["closing_km"]), fmt="#,##0")
+            _put(ws, r, 3, float(e["starting_km"]), fmt="#,##0")
+            _put(ws, r, 4, f"=B{r}-C{r}", fmt="#,##0")
+            _put(ws, r, 5, float(e["fuel_litres"]), fmt="0.00")
+            _put(ws, r, 6, f"=IFERROR(D{r}/E{r},0)", fmt="0.00")
+            _put(ws, r, 7, e["bill_no"] or None)
+            _put(ws, r, 8, bill_date, fmt=F_DATE)
+            _put(ws, r, 9, float(e["amount"]), fmt=F_MONEY, h="right")
+            _put(ws, r, 10, f"=IFERROR(I{r}/D{r},0)", fmt=F_MONEY, h="right")
+            _put(ws, r, 11, e["remarks"] or None, h="left", wrap=True)
+            r += 1
+        last = r - 1
+        _merge(ws, r, 1, 3, f"Sub Total  -  {label}", bold=True, color=NAVY, fill=SUB,
+               h="left", border=TOP_RULE)
+        _put(ws, r, 4, f"=SUM(D{first}:D{last})", bold=True, fill=SUB, fmt="#,##0", border=TOP_RULE)
+        _put(ws, r, 5, f"=SUM(E{first}:E{last})", bold=True, fill=SUB, fmt="0.00", border=TOP_RULE)
+        _put(ws, r, 6, f"=IFERROR(D{r}/E{r},0)", bold=True, fill=SUB, fmt="0.00", border=TOP_RULE)
+        _put(ws, r, 7, f"=COUNT(D{first}:D{last})", bold=True, fill=SUB, fmt='0" fills"', border=TOP_RULE)
+        _put(ws, r, 8, None, fill=SUB, border=TOP_RULE)
+        _put(ws, r, 9, f"=SUM(I{first}:I{last})", bold=True, fill=SUB, fmt=F_MONEY, h="right", border=TOP_RULE)
+        _put(ws, r, 10, f"=IFERROR(I{r}/D{r},0)", bold=True, fill=SUB, fmt=F_MONEY, h="right", border=TOP_RULE)
+        _put(ws, r, 11, None, fill=SUB, border=TOP_RULE)
+        sub_rows[mk] = r
+        r += 1
+        ws.row_dimensions[r].height = 8
+        r += 1
+
+    refs = list(sub_rows.values())
+
+    def tot(col):
+        return "=SUM(" + ",".join(f"{col}{x}" for x in refs) + ")"
+
+    _merge(ws, r, 1, 3, "GRAND TOTAL", bold=True, color="FFFFFF", fill=NAVY, h="left", size=11)
+    ws.row_dimensions[r].height = 22
+    _put(ws, r, 4, tot("D"), bold=True, color="FFFFFF", fill=NAVY, fmt="#,##0")
+    _put(ws, r, 5, tot("E"), bold=True, color="FFFFFF", fill=NAVY, fmt="0.00")
+    _put(ws, r, 6, f"=IFERROR(D{r}/E{r},0)", bold=True, color="FFFFFF", fill=NAVY, fmt="0.00")
+    _put(ws, r, 7, tot("G"), bold=True, color="FFFFFF", fill=NAVY, fmt='0" fills"')
+    _put(ws, r, 8, None, fill=NAVY)
+    _put(ws, r, 9, tot("I"), bold=True, color="FFFFFF", fill=NAVY, fmt=F_MONEY, h="right")
+    _put(ws, r, 10, f"=IFERROR(I{r}/D{r},0)", bold=True, color="FFFFFF", fill=NAVY, fmt=F_MONEY, h="right")
+    _put(ws, r, 11, None, fill=NAVY)
+    r += 2
+    _merge(ws, r, 1, n, "Avg KM/L = Total KM / Fuel filled.   Cost / KM = Amount / Total KM.   "
+                         "Sub totals and grand total are live formulas.",
+           italic=True, size=8, color="7F7F7F", border=None, h="left")
+    _page_setup(ws, title_rows="8:8")
+    return sub_rows
+
+
+# --------------------------------------------------------------------------- #
+def _summary_sheet(ws, vehicles, sub_rows, months, org, period, generated):
+    ws.sheet_view.showGridLines = False
+    ws.sheet_properties.tabColor = NAVY
+    nm = len(months)
+    ncol = 3 + nm
+    ws.column_dimensions["A"].width = 24
+    ws.column_dimensions["B"].width = 18
+    for c in range(3, ncol):
+        ws.column_dimensions[L(c)].width = 14
+    ws.column_dimensions[L(ncol)].width = 17
+
+    _banner(ws, ncol, org, "Fuel Consumption Summary  -  Month-wise by Vehicle",
+            f"Period: {period}     |     Generated: {generated:%d-%m-%Y %H:%M}")
+    hdr = 5
+    ws.row_dimensions[hdr].height = 26
+    _put(ws, hdr, 1, "Vehicle", bold=True, color="FFFFFF", fill=HEAD)
+    _put(ws, hdr, 2, "Metric", bold=True, color="FFFFFF", fill=HEAD)
+    for i, mk in enumerate(months):
+        _put(ws, hdr, 3 + i, an.month_label(mk), bold=True, color="FFFFFF", fill=HEAD)
+    _put(ws, hdr, ncol, "Total", bold=True, color="FFFFFF", fill=NAVY)
+    ws.freeze_panes = ws.cell(hdr + 1, 3)
+
+    metrics = [("No. of fills", F_INT, "G"), ("Total KM", F_KM, "D"), ("Fuel (L)", F_DEC, "E"),
+               (f"Amount ({CUR})", F_MONEY, "I"), ("Avg KM/L", F_DEC, None), (f"Cost / KM ({CUR})", F_MONEY, None)]
+    first_m, last_m = L(3), L(2 + nm)
+
+    def write_block(r0, label, sources, fill_a, strong=False):
+        """sources[(row_offset, col_idx)] -> formula body; ratio rows derive from same column."""
+        fill_row = SUB if strong else None
+        merge_end = r0 + len(metrics) - 1
+        _put(ws, r0, 1, label, bold=True, color="FFFFFF" if strong else NAVY, fill=fill_a, wrap=True)
+        for k in range(1, len(metrics)):
+            _put(ws, r0 + k, 1, None, fill=fill_a)
+        ws.merge_cells(start_row=r0, start_column=1, end_row=merge_end, end_column=1)
+        for k, (name, fmt, _src) in enumerate(metrics):
+            r = r0 + k
+            _put(ws, r, 2, name, bold=strong, h="left", fill=fill_row, italic=k >= 4)
+            for ci in range(3, ncol + 1):
+                col = L(ci)
+                if k < 4:
+                    val = (f"=SUM({first_m}{r}:{last_m}{r})" if ci == ncol else sources(k, ci))
+                elif k == 4:
+                    val = f"=IFERROR({col}{r0 + 1}/{col}{r0 + 2},0)"
+                else:
+                    val = f"=IFERROR({col}{r0 + 3}/{col}{r0 + 1},0)"
+                _put(ws, r, ci, val, fmt=fmt, bold=strong or ci == ncol, fill=fill_row or (BAND if ci == ncol else None),
+                     h="right", italic=k >= 4)
+        return r0
+
+    r = hdr + 1
+    blocks = []
+    for veh in vehicles:
+        rows = sub_rows[veh["reg_no"]]
+        sheet = veh["sheet"]
+
+        def src(k, ci, rows=rows, sheet=sheet):
+            mk = months[ci - 3]
+            if mk not in rows:
+                return 0
+            return f"='{sheet}'!{metrics[k][2]}{rows[mk]}"
+
+        write_block(r, veh["reg_no"], src, BAND)
+        blocks.append((veh["reg_no"], r))
+        r += len(metrics)
+        ws.row_dimensions[r].height = 6
+        r += 1
+
+    if len(blocks) > 1:
+        def fleet(k, ci):
+            col = L(ci)
+            return "=SUM(" + ",".join(f"{col}{b + k}" for _, b in blocks) + ")"
+        write_block(r, "ALL VEHICLES", fleet, NAVY, strong=True)
+        r += len(metrics) + 1
+
+    _merge(ws, r, 1, ncol, "Figures link to the sub totals on each vehicle sheet. "
+                           "Avg KM/L = Total KM / Fuel; Cost / KM = Amount / Total KM.",
+           italic=True, size=8, color="7F7F7F", border=None, h="left")
+    r += 2
+
+    # Monthly fuel-cost chart
+    ch = BarChart()
+    ch.type = "col"
+    ch.grouping = "clustered"
+    ch.title = f"Monthly Fuel Cost ({CUR}) by Vehicle"
+    ch.roundedCorners = False
+    ch.title.overlay = False
+    ch.style = 10
+    for reg, b in blocks:
+        s = Series(Reference(ws, min_col=3, max_col=2 + nm, min_row=b + 3, max_row=b + 3), title=reg)
+        ch.series.append(s)
+    ch.set_categories(Reference(ws, min_col=3, max_col=2 + nm, min_row=hdr, max_row=hdr))
+    ch.y_axis.title = f"Amount ({CUR})"
+    ch.y_axis.title.overlay = False
+    ch.y_axis.numFmt = "#,##0"
+    ch.y_axis.majorGridlines = ch.y_axis.majorGridlines
+    ch.x_axis.delete = False
+    ch.y_axis.delete = False
+    ch.legend.position = "b"
+    ch.legend.overlay = False
+    ch.height, ch.width = 9, max(18, min(34, 3 + nm * 3.2))
+    ws.add_chart(ch, f"A{r}")
+    _page_setup(ws)
+
+
+# --------------------------------------------------------------------------- #
+def build_workbook(entries: pd.DataFrame, vehicles: pd.DataFrame, org_name: str,
+                   period_label: str) -> bytes:
+    """entries must come from db.entries_df(); vehicles from db.vehicles_df()."""
+    generated = datetime.now()
+    wb = Workbook()
+    summary = wb.active
+    summary.title = "Summary"
+
+    vmap = vehicles.set_index("reg_no").to_dict("index")
+    used: set[str] = set()
+    veh_list, sub_rows = [], {}
+    for reg in sorted(entries["reg_no"].unique()):
+        g = entries[entries["reg_no"] == reg]
+        info = {"reg_no": reg, **vmap.get(reg, {})}
+        info["sheet"] = _safe_sheet_name(reg, used)
+        sub_rows[reg] = _vehicle_sheet(wb, info["sheet"], info, g, org_name, period_label, generated)
+        veh_list.append(info)
+
+    _summary_sheet(summary, veh_list, sub_rows, an.month_keys_between(entries),
+                   org_name, period_label, generated)
+
+    wb.properties.title = "Fuel Consumption Report"
+    wb.properties.creator = org_name
+    buf = io.BytesIO()
+    wb.save(buf)
+    return buf.getvalue()
+
+
+# --------------------------------------------------------------------------- #
+# Reading a report back in (restore / re-import)
+IMPORT_COLS = ["Vehicle", "Date", "Closing KM", "Starting KM", "Fuel (L)",
+               "Bill No", "Bill Date", "Amount", "Remarks"]
+
+
+def _clean(v):
+    return "" if v is None or str(v).strip() in ("-", "None") else str(v).strip()
+
+
+def _is_num(v) -> bool:
+    return isinstance(v, (int, float)) and not isinstance(v, bool)
+
+
+def parse_report(file):
+    """Read a workbook produced by build_workbook().
+
+    Returns (entries_frame, vehicle_infos). The frame uses the import column names;
+    sub total / grand total / month-band rows are ignored. Returns (empty, []) when the
+    file is not in the report layout.
+    """
+    wb = load_workbook(file, data_only=True)
+    rows, infos = [], []
+    for ws in wb.worksheets:
+        if ws.title == "Summary" or str(ws["A8"].value or "").strip() != "Date":
+            continue
+        reg = _clean(ws["B4"].value).upper()
+        if not reg:
+            continue
+        tank = re.search(r"[\d.]+", _clean(ws["F5"].value))
+        infos.append({"reg_no": reg, "name": _clean(ws["B5"].value), "driver": _clean(ws["F4"].value),
+                      "tank_capacity": float(tank.group()) if tank else 0.0,
+                      "fc_date": _clean(ws["B6"].value) or None})
+        for r in ws.iter_rows(min_row=9, max_col=11, values_only=True):
+            d = r[0]
+            if isinstance(d, (datetime, date)) and _is_num(r[1]) and _is_num(r[2]) and _is_num(r[4]):
+                bill = r[6]
+                if isinstance(bill, float) and bill.is_integer():
+                    bill = int(bill)
+                rows.append([reg, d, r[1], r[2], r[4], _clean(bill), r[7], r[8] if _is_num(r[8]) else 0, _clean(r[10])])
+    return pd.DataFrame(rows, columns=IMPORT_COLS), infos
+
+
+def sample_template() -> bytes:
+    """A small workbook in exactly the export layout, usable as an import template."""
+    d = lambda y, m, dd: pd.Timestamp(y, m, dd)
+    raw = pd.DataFrame({
+        "id": [1, 2, 3], "vehicle_id": [1, 1, 1], "reg_no": ["TN-21-F-5500"] * 3,
+        "entry_date": [d(2026, 4, 7), d(2026, 4, 12), d(2026, 5, 20)],
+        "closing_km": [49608, 50183, 50665], "starting_km": [49025, 49608, 50183],
+        "fuel_litres": [71.0, 72.06, 58.62], "bill_no": ["45925", "45925", "46209"],
+        "bill_date": [d(2026, 4, 7), d(2026, 4, 12), d(2026, 5, 20)],
+        "amount": [6700.0, 6840.0, 5750.0], "remarks": ["", "", "Sample row - replace"]})
+    entries = an.enrich(raw)
+    veh = pd.DataFrame([{"reg_no": "TN-21-F-5500", "name": "Vehicle description", "driver": "Driver name",
+                         "tank_capacity": 90.0, "fc_date": pd.Timestamp(2026, 8, 11)}])
+    return build_workbook(entries, veh, "Your organisation", "Template")
+
+
+
+================================================================================
+FILE: export_context.py
+================================================================================
+
+
+import os
+
+# Folder to scan
+SOURCE_FOLDER = r"C:\Users\ELCOT\Downloads\files"
+
+# Output text file
+OUTPUT_FILE = "code_context.txt"
+
+# File extensions to include
+CODE_EXTENSIONS = {
+    ".py", ".js", ".jsx", ".ts", ".tsx",
+    ".html", ".css", ".scss",
+    ".java", ".cpp", ".c", ".h", ".cs",
+    ".php", ".rb", ".go", ".rs",
+    ".sql", ".sh", ".bat",
+    ".json", ".xml", ".yaml", ".yml",
+    ".md", ".txt", ".ipynb",
+    ".dart", ".swift", ".kt",
+    ".vue", ".svelte"
+}
+
+# Folders to ignore
+IGNORE_DIRS = {
+    ".git", "__pycache__", "node_modules",
+    ".venv", "venv", "dist", "build",
+    ".idea", ".vscode"
+}
+
+def export_code_context():
+    with open(OUTPUT_FILE, "w", encoding="utf-8") as output:
+
+        for root, dirs, files in os.walk(SOURCE_FOLDER):
+
+            # Skip unwanted folders
+            dirs[:] = [
+                d for d in dirs if d not in IGNORE_DIRS
+            ]
+
+            for filename in sorted(files):
+                ext = os.path.splitext(filename)[1].lower()
+
+                if ext not in CODE_EXTENSIONS:
+                    continue
+
+                file_path = os.path.join(root, filename)
+                relative_path = os.path.relpath(
+                    file_path, SOURCE_FOLDER
+                )
+
+                try:
+                    with open(
+                        file_path, "r", encoding="utf-8"
+                    ) as file:
+                        content = file.read()
+
+                    output.write("\n")
+                    output.write("=" * 80 + "\n")
+                    output.write(f"FILE: {relative_path}\n")
+                    output.write("=" * 80 + "\n\n")
+                    output.write(content)
+                    output.write("\n\n")
+
+                    print(f"Exported: {relative_path}")
+
+                except Exception as e:
+                    print(f"Skipped: {relative_path} - {e}")
+
+    print(f"\nExport completed: {OUTPUT_FILE}")
+
+
+if __name__ == "__main__":
+    export_code_context()
+
+
+
+================================================================================
+FILE: requirements.txt
+================================================================================
+
+streamlit>=1.36
+pandas>=2.0
+openpyxl>=3.1
+
+
