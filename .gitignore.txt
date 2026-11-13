@@ -1,0 +1,4 @@
+.venv
+config.zip
+__pycache__/
+__pycache__\
