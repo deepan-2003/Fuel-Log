@@ -503,6 +503,6 @@ with tab_xl:
             st.error(f"Could not read the file: {exc}")
 
     section("Backup")
-    st.download_button("Download database backup (.db)", data=db.backup_bytes(),
-                       file_name=f"fuel_log_backup_{date.today():%Y%m%d}.db",
-                       mime="application/octet-stream")
+    st.download_button("Download data backup (.json)", data=db.backup_bytes(),
+                       file_name=f"fuel_log_backup_{date.today():%Y%m%d}.json",
+                       mime="application/json")
