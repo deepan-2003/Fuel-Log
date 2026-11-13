@@ -27,15 +27,32 @@ PERIOD_CHOICES = [
 
 
 # --------------------------------------------------------------------------- #
+def _numeric(series: pd.Series) -> pd.Series:
+    """Convert PostgreSQL Decimal/object values to pandas numeric values."""
+    return pd.to_numeric(series, errors="coerce").astype("float64")
+
+
 def _ratio(num: pd.Series, den: pd.Series) -> pd.Series:
     """num / den, NaN wherever the denominator is zero or missing."""
-    return num / den.where(den > 0)
+    numerator = _numeric(num)
+    denominator = _numeric(den)
+    return numerator / denominator.where(denominator > 0)
 
 
 def enrich(df: pd.DataFrame) -> pd.DataFrame:
-    """Add total_km, mileage, cost columns and month keys to an entries frame."""
+    """Add total_km, mileage, cost columns and month keys to an entries frame.
+
+    PostgreSQL NUMERIC columns are returned by psycopg2 as decimal.Decimal.
+    Convert numeric columns to float64 before arithmetic so Decimal/float
+    operations do not raise TypeError in pandas.
+    """
     df = df.copy()
-    df["entry_date"] = pd.to_datetime(df["entry_date"])
+
+    for col in ("closing_km", "starting_km", "fuel_litres", "amount"):
+        if col in df.columns:
+            df[col] = _numeric(df[col])
+
+    df["entry_date"] = pd.to_datetime(df["entry_date"], errors="coerce")
     df["bill_date"] = pd.to_datetime(df["bill_date"], errors="coerce")
     df["total_km"] = df["closing_km"] - df["starting_km"]
     df["mileage"] = _ratio(df["total_km"], df["fuel_litres"])
@@ -130,8 +147,10 @@ def month_matrix(df: pd.DataFrame, metric: str) -> pd.DataFrame:
         return _sum_matrix(d, field, keys)
     km = _sum_matrix(d, "total_km", keys)
     if field == "mileage":
-        return km / _sum_matrix(d, "fuel_litres", keys).where(lambda x: x > 0)
-    return _sum_matrix(d, "amount", keys) / km.where(km > 0)
+        fuel = _sum_matrix(d, "fuel_litres", keys)
+        return km / fuel.where(fuel > 0)
+    amount = _sum_matrix(d, "amount", keys)
+    return amount / km.where(km > 0)
 
 
 # --------------------------------------------------------------------------- #
